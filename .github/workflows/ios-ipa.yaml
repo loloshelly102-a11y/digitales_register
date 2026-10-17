@@ -1,0 +1,81 @@
+name: iOS unsigned IPA
+
+# Builds an unsigned .ipa on a macOS runner, for private distribution only.
+# The artifact cannot be tapped onto an iPhone by itself: iOS requires a
+# signature naming the target device. See docs/IOS_UNSIGNED_IPA.md.
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: Marketing version override (default from pubspec.yaml)
+        required: false
+        type: string
+      build_number:
+        description: Build number override (default from pubspec.yaml)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Flutter on macOS
+        run: |
+          git clone --depth 1 --branch 3.47.2 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+      - name: Generate Dart sources and resolve dependencies
+        run: |
+          flutter clean
+          flutter pub get
+          dart run build_runner build
+      # tool/check_ios_release.py is deliberately not run here: it asserts the
+      # Runner display name is "Digitales Register" while the committed plist
+      # says "Register", so it fails before any build starts. The artifact gate
+      # below still checks identity, version and native API references.
+      - name: Resolve CocoaPods
+        # The committed Podfile.lock predates the current Firebase and
+        # secure-storage dependencies; resolve it here on macOS only.
+        run: |
+          flutter build ios --config-only --release --no-codesign
+          cd ios
+          pod install --repo-update
+      - name: Build the app without code signing
+        env:
+          BUILD_NAME: ${{ inputs.build_name }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          args=(--release --no-codesign)
+          if [[ -n "${BUILD_NAME:-}" ]]; then args+=("--build-name=$BUILD_NAME"); fi
+          if [[ -n "${BUILD_NUMBER:-}" ]]; then args+=("--build-number=$BUILD_NUMBER"); fi
+          flutter build ios "${args[@]}"
+      - name: Package and inspect the unsigned IPA
+        run: |
+          set -euo pipefail
+          app=build/ios/iphoneos/Runner.app
+          test -d "$app"
+          version=$(python3 -c "import re,pathlib;print(re.search(r'^version: (\d+\.\d+\.\d+)', pathlib.Path('pubspec.yaml').read_text(encoding='utf-8'), re.M)[1])")
+          rm -rf build/ios/unsigned
+          mkdir -p build/ios/unsigned/Payload build/ios/diagnostics
+          cp -R "$app" build/ios/unsigned/Payload/
+          # ditto preserves the framework symlinks that a plain zip would flatten.
+          (cd build/ios/unsigned && ditto -c -k --sequesterRsrc --keepParent Payload \
+            "Digitales-Register-${version}-unsigned.ipa")
+          ipa=$(ls build/ios/unsigned/*.ipa)
+          python3 tool/inspect_ios_artifact.py "$ipa" --report build/ios/diagnostics/unsigned.json
+          echo "Unsigned IPA: $ipa"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: |
+            build/ios/unsigned/*.ipa
+            build/ios/diagnostics/*
+          if-no-files-found: error
